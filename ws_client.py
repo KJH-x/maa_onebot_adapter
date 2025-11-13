@@ -9,6 +9,8 @@ from websockets.asyncio.client import ClientConnection
 
 CONFIG_FILE = "./loop/config.json"
 
+# 此脚本是maa控制端（不成熟版本）暂未给出使用方法
+
 
 def load_config() -> tuple[str, list[str], str, str]:
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
