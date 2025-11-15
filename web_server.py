@@ -2,12 +2,13 @@ import asyncio
 import json
 import logging
 import time
+from http import HTTPStatus
 from types import TracebackType
 from typing import Any, Optional, Type
 
 import aiohttp
 from aiohttp import web
-from aiohttp.web_request import Request
+from aiohttp.web_request import Request as WebRequest
 from file_handler import load_config, write_config
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import (
@@ -15,6 +16,7 @@ from websockets.exceptions import (
     ConnectionClosedError,
     ConnectionClosedOK,
 )
+from websockets.http11 import Request as WS11Request
 
 logger = logging.getLogger('app')
 
@@ -558,7 +560,7 @@ class AioHttpServerWrapper:
 def create_http_app(api_path: str = "/apipath"):
     app = web.Application()
 
-    async def http_handler(request: Request):
+    async def http_handler(request: WebRequest):
         client_info = request.remote or "Unknown"
 
         logger.info(f"收到来自 ({client_info}) 的 ({request.method}) 请求 ({api_path})")
@@ -601,3 +603,61 @@ def create_http_app(api_path: str = "/apipath"):
         web.route('*', '/{tail:.*}', undefined_path_handler)
         ])
     return app
+
+
+async def process_request(connection: ServerConnection, request: WS11Request):
+    """
+    为了解决以下来自 asyncio.wait 的报错 尝试使用此函数, 但暂未成功
+
+    相关讨论: [fastapi/fastapi/"opening handshake failed" for websocket endpoint #8388](https://github.com/fastapi/fastapi/discussions/8388)
+
+    完整的报错信息:
+    ```
+        opening handshake failed
+    Traceback (most recent call last):
+    File "/miniconda3/Lib/site-packages/websockets/http11.py", line 138, in parse
+        request_line = yield from parse_line(read_line)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/miniconda3/Lib/site-packages/websockets/http11.py", line 309, in parse_line
+        line = yield from read_line(MAX_LINE_LENGTH)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/miniconda3/Lib/site-packages/websockets/streams.py", line 46, in read_line
+        raise EOFError(f"stream ends after {p} bytes, before end of line")
+    EOFError: stream ends after 0 bytes, before end of line
+
+    The above exception was the direct cause of the following exception:
+
+    Traceback (most recent call last):
+    File "/miniconda3/Lib/site-packages/websockets/server.py", line 545, in parse
+        request = yield from Request.parse(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^
+            self.reader.read_line,
+            ^^^^^^^^^^^^^^^^^^^^^^
+        )
+        ^
+    File "/miniconda3/Lib/site-packages/websockets/http11.py", line 140, in parse
+        raise EOFError("connection closed while reading HTTP request line") from exc
+    EOFError: connection closed while reading HTTP request line
+
+    The above exception was the direct cause of the following exception:
+
+    Traceback (most recent call last):
+    File "/miniconda3/Lib/site-packages/websockets/asyncio/server.py", line 356, in conn_handler
+        await connection.handshake(
+        ...<3 lines>...
+        )
+    File "/miniconda3/Lib/site-packages/websockets/asyncio/server.py", line 207, in handshake
+        raise self.protocol.handshake_exc
+    websockets.exceptions.InvalidMessage: did not receive a valid HTTP request
+    ```
+    """
+    # 拦截所有非 WebSocket 升级请求
+    connection_hdr = request.headers.get("Connection", "").lower()
+    peername = connection.transport.get_extra_info("peername")
+
+    if "upgrade" not in connection_hdr:
+        logger.warning(f"[ WS ] 来自 ({peername or None}) 的 HTTP 握手错误, 返回 400 BAD_REQUEST")
+        return connection.respond(HTTPStatus.BAD_REQUEST, text="upgrade not in connection")
+
+    logger.warning(f"[ WS ] ({connection.subprotocol})")
+    return None  # None = 继续 WebSocket 握手

@@ -4,7 +4,12 @@ from typing import Any
 
 import websockets
 from file_handler import load_config, setup_logging
-from web_server import AioHttpServerWrapper, WebSocketServer, create_http_app
+from web_server import (
+    AioHttpServerWrapper,
+    WebSocketServer,
+    create_http_app,
+    process_request,
+)
 
 
 async def main(config: dict[str, Any], port_config: dict[str, int], host: str = "0.0.0.0"):
@@ -12,7 +17,8 @@ async def main(config: dict[str, Any], port_config: dict[str, int], host: str = 
     server = WebSocketServer(config)
     http_server = create_http_app('/maaReport')
 
-    async with websockets.serve(server.handler, host, port_config["ws"]):
+    async with websockets.serve(server.handler, host, port_config["ws"],
+                                process_request=process_request):
         async with AioHttpServerWrapper(http_server, host, port_config["http"]):
 
             main_logger.info(f"WebSocket (@{port_config['ws']}) 和 HTTP (@{port_config['http']}) 服务器已启动")
