@@ -38,9 +38,9 @@ class WebSocketServer:
         logger.debug(f"http target: {self.http_uri}")
 
         # ws 客户端列表
-        self.client_info: list[dict[str, Any]] = config.get("client_info", "")
+        self.client_info: list[dict[str, str]] = config.get("client_info", "")
         # 构建 UA->token 映射，便于快速查找
-        self.ua_token_map = {info.get("UA", ""): info.get("Bearer", {}).get("token", "") for info in self.client_info}
+        self.ua_token_map = {info.get("UA", ""): info.get("token", "") for info in self.client_info}
         logger.debug(f"ua_token_map: {self.ua_token_map}")
 
         # 本地状态缓存
@@ -50,6 +50,11 @@ class WebSocketServer:
         # 用户映射
         self.user_map: dict[str, dict[str, Any]] = config.get("user_map", {})
         self.log_to: dict[str, Any] = config.get("log_to", {})
+
+        # 会话 WS 集
+        # self.clients: dict[str,] = {'OneBot/11': [], 'MaaCtrl/00': []}
+        self.OneBotClients:  Optional[ServerConnection] = None
+        self.MaaCtrlClients:  Optional[ServerConnection] = None
 
     def get_message_text(self, message_dict: dict[str, Any], lower: bool = True):
         chat_message_struct: list[dict[str, Any]] = message_dict.get("message", {})
@@ -524,7 +529,15 @@ class WebSocketServer:
 
         finally:
             logger.info(f"🛑 连接处理结束: {client_address}")
-            connection.close()
+            await websocket.close()
+            if client_type == 'OneBot/11':
+                self.OneBotClients = None
+                logger.info(f"✅ 已经释放连接 OneBot/11")
+            elif client_type == 'MaaCtrl/00':
+                self.MaaCtrlClients = None
+                logger.info(f"✅ 已经释放连接 MaaCtrl/00")
+            else:
+                logger.info(f"❓ 未知链接类型")
 
 
 class AioHttpServerWrapper:
