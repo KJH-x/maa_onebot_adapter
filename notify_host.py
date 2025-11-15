@@ -27,9 +27,9 @@ async def main(config: dict[str, Any], port_config: dict[str, int], host: str = 
 
 if __name__ == "__main__":
     main_logger = setup_logging(log_level=logging.INFO)
-    main_logger.info('日志系统已初始化')
+    main_logger.info('[HOST] (I) 日志系统已初始化')
     local_config = load_config()
-    main_logger.info('已读取配置文件')
+    main_logger.info('[HOST] (I) 已读取配置文件')
 
     try:
         asyncio.run(main(local_config,{'ws': 8765, 'http': 8080}))
