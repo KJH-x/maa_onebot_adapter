@@ -120,7 +120,7 @@ async def main_ws(url: str, token: str, config_list: List[Any]) -> None:
 
     # 1. 构建WebSocket连接所需的Header
     custom_headers: dict[str, str] = {
-        'User-Agent': 'MaaReport/00',
+        'User-Agent': 'MaaCtrl/00',
         'Authorization': f'Bearer {token}',
     }
 
