@@ -7,9 +7,9 @@ from types import TracebackType
 from typing import Any, Optional, Type
 
 import aiohttp
+import uuid6
 from aiohttp import web
 from aiohttp.web_request import Request as WebRequest
-from file_handler import load_config, write_config
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import (
     ConnectionClosed,
@@ -17,6 +17,8 @@ from websockets.exceptions import (
     ConnectionClosedOK,
 )
 from websockets.http11 import Request as WS11Request
+
+from file_handler import load_config, write_config
 
 logger = logging.getLogger('app')
 
@@ -49,12 +51,15 @@ class WebSocketServer:
 
         # 用户映射
         self.user_map: dict[str, dict[str, Any]] = config.get("user_map", {})
-        self.log_to: dict[str, Any] = config.get("log_to", {})
+        self.msg_route: dict[str, Any] = config.get("msg_route", {})
 
         # 会话 WS 集
         # self.clients: dict[str,] = {'OneBot/11': [], 'MaaCtrl/00': []}
         self.OneBotClients:  Optional[ServerConnection] = None
         self.MaaCtrlClients:  Optional[ServerConnection] = None
+
+        # 消息等待池
+        self.waiting_pool: dict[str, asyncio.Future[Any]] = {}
 
     def get_message_text(self, message_dict: dict[str, Any], lower: bool = True):
         chat_message_struct: list[dict[str, Any]] = message_dict.get("message", {})
@@ -68,7 +73,7 @@ class WebSocketServer:
         else:
             return chat_message_text
 
-    async def construct_reply(
+    async def make_http_msg(
         self,
             message_dict: dict[str, Any],
             reply_message: list[str] = [""],
@@ -103,6 +108,55 @@ class WebSocketServer:
             })
         data.update({"message": structured_message})
         return data
+
+    async def make_websocket_msg(
+        self,
+            original_msg: dict[str, Any],
+            reply_text: list[str] = [""],
+            at: Optional[int] = None,
+            reply_image: Any = None
+    ) -> dict[str, Any]:
+        websocket_data: dict[str, Any] = {}
+        inner_data: dict[str, Any] = {}
+        structured_message: list[Any] = []
+        message_type = original_msg.get("message_type", "")
+        user_id: str = original_msg.get("user_id", "")
+        group_id: str = original_msg.get("group_id", "")
+
+        # 发信类型 群组/私聊
+        if message_type == "group":
+            websocket_data.update({"action": "send_group_msg"})
+            inner_data.update({"group_id": f"{group_id}"})
+        elif message_type == "private":
+            websocket_data.update({"action": "send_private_msg"})
+            inner_data.update({"user_id": f"{user_id}"})
+        else:
+            logger.error("original message type is neither group or private")
+            raise ValueError(f"original message type {original_msg} is neither group or private")
+
+        # @user_id 会在消息最前端
+        if at and message_type == "group":
+            structured_message.append({
+                "type": "at",
+                "data": {"qq": f"{at}"}
+            })
+
+        # 拼接加入所有消息
+        for msg in reply_text:
+            structured_message.append({
+                "type": "text",
+                "data": {"text": f"{msg}"}
+            })
+        inner_data.update({"message": structured_message})
+
+        # ENcode image as base64 string
+        # TODO:...
+
+        # 合并消息
+        websocket_data.update({"params": inner_data})
+        # 添加标识符
+        websocket_data.update({"echo": str(uuid6.uuid7())})
+        return websocket_data
 
     async def send_dict_to_client(self, websocket: ServerConnection, data_to_send: dict[str, Any], api_path: str = ""):
         """
@@ -267,7 +321,7 @@ class WebSocketServer:
         client_address = websocket.remote_address
         # 检查连接信息
         if not getattr(websocket, "request", None):
-            logger.warning(f"放弃来自({client_address[0]}:{client_address[1]})的未知连接，其 request 为空")
+            logger.warning(f"[ WS ] (X) 放弃来自({client_address[0]}:{client_address[1]})的未知连接，其 request 为空")
             return False, None
 
         # 连接信息获取
@@ -318,6 +372,14 @@ class WebSocketServer:
                 user_id: int = message_dict.get("user_id", "")
                 group_id: int = message_dict.get("group_id", "")
 
+                # 协程消息共享
+                if (msg_id := message_dict.get("echo", "")) and msg_id in self.waiting_pool:
+                    future = self.waiting_pool[msg_id]
+                    if not future.done():
+                        future.set_result(message_dict)
+                    # 不继续处理
+                    continue
+
                 # 筛选对话白名单
                 if (group_id in self.active_group and message_type == "group") or\
                         (user_id in self.active_private and message_type == "private"):
@@ -330,8 +392,8 @@ class WebSocketServer:
                         chat_command = chat_message_text.removeprefix("maa").strip()
 
                         if chat_command in ["help", ""]:
-                            reply_data = await self.construct_reply(
-                                message_dict=message_dict, reply_message=[
+                            reply_data = await self.make_websocket_msg(
+                                original_msg=message_dict, reply_text=[
                                     "提示词MAA, 大小写通用\n",
                                     "命令/别名 功能描述\n",
                                     "help （空）显示本帮助信息\n",
@@ -346,64 +408,87 @@ class WebSocketServer:
 
                         # 处理命令
                         elif chat_command in ["测试", "test"]:
-                            reply_data = await self.construct_reply(
-                                message_dict=message_dict, reply_message=["测试收到"]
+                            reply_data = await self.make_websocket_msg(
+                                original_msg=message_dict, reply_text=["测试收到"]
                             )
 
                         elif chat_command in ["ws状态", "ws"]:
-                            try:
-                                pong = await websocket.ping()
-                                latency = await pong
+                            if self.MaaCtrlClients:
+                                try:
+                                    pong = await websocket.ping()
+                                    latency_1 = await pong
+                                    pong = await self.MaaCtrlClients.ping()
+                                    latency_2 = await pong
 
-                                reply_data = await self.construct_reply(
-                                    message_dict=message_dict,
-                                    reply_message=[" MAA 控制器的 web socket 连接状态为：",
-                                                   self.maa_reports_cache["Connection"],
-                                                   f"延迟{latency*1000:.1f}ms"]
+                                    reply_data = await self.make_websocket_msg(
+                                        original_msg=message_dict,
+                                        reply_text=[
+                                            f"🐧-{latency_1*1000:.1f}ms-🔄-{latency_2*1000:.1f}ms-<⚙>"]
+                                    )
+                                except ConnectionClosed:
+                                    reply_data = await self.make_websocket_msg(
+                                        original_msg=message_dict,
+                                        reply_text=[" MAA 控制器的 web socket 连接已断开"]
+                                    )
+                                    self.maa_reports_cache.update({"Connection": "Unreachable"})
+                                    write_config(data=self.maa_reports_cache, config_path="cache.json")
+                            else:
+                                reply_data = await self.make_websocket_msg(
+                                    original_msg=message_dict,
+                                    reply_text=["未与 MAA 控制器建立连接, 且专用 ws 资源未释放"]
                                 )
-                            except ConnectionClosed:
-                                reply_data = await self.construct_reply(
-                                    message_dict=message_dict,
-                                    reply_message=[" MAA 控制器的 web socket 连接已断开"]
-                                )
-                                self.maa_reports_cache.update({"Connection": "Unreachable"})
+                                self.maa_reports_cache.update({"Connection": "CannotEstablish"})
                                 write_config(data=self.maa_reports_cache, config_path="cache.json")
 
                         elif chat_command in ["现在", "当前", "currentuser", "current"]:
-                            reply_data = await self.construct_reply(
-                                message_dict=message_dict,
-                                reply_message=[" MAA 当前正在执行 ",
-                                               self.maa_reports_cache["CurruentUser"],
-                                               " 的配置"]
+                            reply_data = await self.make_websocket_msg(
+                                original_msg=message_dict,
+                                reply_text=[" MAA 当前正在执行 ",
+                                            self.maa_reports_cache["CurruentUser"],
+                                            " 的配置"]
                             )
 
                         elif chat_command in ["下一个", "即将", "nextuser", "next"]:
-                            reply_data = await self.construct_reply(
-                                message_dict=message_dict,
-                                reply_message=[" MAA 当前正在执行 ",
-                                               self.maa_reports_cache["NextUser"],
-                                               " 的配置"]
+                            reply_data = await self.make_websocket_msg(
+                                original_msg=message_dict,
+                                reply_text=[" MAA 当前正在执行 ",
+                                            self.maa_reports_cache["NextUser"],
+                                            " 的配置"]
                             )
 
                         elif chat_command in ["host", "控制器", "controller", "next", "status"]:
-                            reply_data = await self.construct_reply(
-                                message_dict=message_dict,
-                                reply_message=[" MAA 和控制器当前的状态为",
-                                               self.maa_reports_cache["Status"]]
+                            reply_data = await self.make_websocket_msg(
+                                original_msg=message_dict,
+                                reply_text=[" MAA 和控制器当前的状态为",
+                                            self.maa_reports_cache["Status"]]
                             )
 
                         elif chat_command in ["report"]:
-                            reply_data = await self.construct_reply(
-                                message_dict=message_dict,
-                                reply_message=[f"当前配置: {self.maa_reports_cache["CurruentUser"]}\n",
-                                               f"下一配置: {self.maa_reports_cache["NextUser"]}\n",
-                                               f"ws连接: {self.maa_reports_cache["Connection"]}\n",
-                                               f"控制器状态: {self.maa_reports_cache["Status"]}\n",]
+                            reply_data = await self.make_websocket_msg(
+                                original_msg=message_dict,
+                                reply_text=[f"当前配置: {self.maa_reports_cache["CurruentUser"]}\n",
+                                            f"下一配置: {self.maa_reports_cache["NextUser"]}\n",
+                                            f"ws连接: {self.maa_reports_cache["Connection"]}\n",
+                                            f"控制器状态: {self.maa_reports_cache["Status"]}\n",]
                             )
                         else:
                             continue
 
-                        _ = await self.send(api_path=f"send_{message_type}_msg", data_to_send=reply_data)
+                        # _ = await self.send(api_path=f"send_{message_type}_msg", data_to_send=reply_data)
+                        # message_dict.update({"action": f"send_{message_type}_msg"})
+                        msg_id = reply_data.get("echo", "")
+                        logger.info(f'{reply_data}')
+                        _ = await self.OneBotClients.send(json.dumps(reply_data))
+                        while True:
+                            response = await self.OneBotClients.recv()
+                            if isinstance(response, bytes):
+                                response = response.decode('utf-8')
+                            response_data: dict[str, Any] = json.loads(response)
+                            if (echo := response_data.get("echo", "")) and echo == msg_id:
+                                logger.info(f"📩 收到响应:{response_data}")
+                                break
+                            else:
+                                logger.info(response)
 
             except json.JSONDecodeError as e:
                 logger.error(f"❌ 错误：JSON解析失败！原始消息不是合法的JSON格式。")
@@ -447,7 +532,9 @@ class WebSocketServer:
                 # 如果汇报有配置才提醒
                 user: str = message_dict.get("CurruentUser", "")
                 TotalSteps: str = message_dict.get("TotalSteps", "")
-                if (update_status := message_dict.get("Status", "")) == "GotoNext":
+
+                # 个性化通知
+                if (update_status := message_dict.get("Status", "")) == "Next_Step":
                     # 查本地表
                     user_id: int = self.user_map[user].get("user_id", "")
                     group_id: int = self.user_map[user].get("group_id", "")
@@ -458,12 +545,26 @@ class WebSocketServer:
                     notify_message_list.append(f" 即将开始运行MAA一键长草（20s），请注意\n")
 
                     # 特别地，群聊发送时，获取上一个人信息
-                    if message_type == "group" and last_user:
-                        _api_response = await self.send("get_group_member_info", {
-                            "group_id": group_id,
-                            "user_id": last_user,
-                            "no_cache": False
+                    if message_type == "group" and last_user and self.OneBotClients:
+                        msg_id = str(uuid6.uuid7())
+                        request_data: dict[str, Any] = {"action": "get_group_member_info", "echo": msg_id}
+                        future: asyncio.Future[Any] = asyncio.Future()
+                        self.waiting_pool[msg_id] = future
+                        request_data.update({
+                            "params": {
+                                "group_id": group_id,
+                                "user_id": last_user,
+                                "no_cache": False
+                            }
                         })
+
+                        await self.OneBotClients.send(json.dumps(request_data))
+                        # _api_response = await self.send("get_group_member_info", {
+                        #     "group_id": group_id,
+                        #     "user_id": last_user,
+                        #     "no_cache": False
+                        # })
+                        _api_response = await future
                         if _api_response:
                             _api_data: dict[str, Any] | None = _api_response.get("data", {})
                             if _api_data:
@@ -474,36 +575,71 @@ class WebSocketServer:
                                 notify_message_list.append(f"\n上一配置已完成,耗时{duration:.2f}分钟")
 
                     # 群内 @user_id, 私聊因为 message_dict 中的 message_type 为 private. 不会将@加入
-                    notify_data = await self.construct_reply(
-                        message_dict=message_dict,
-                        reply_message=notify_message_list,
+                    reply_data = await self.make_websocket_msg(
+                        original_msg=message_dict,
+                        reply_text=notify_message_list,
                         at=user_id
                     )
-                    _ = await self.send(api_path=f"send_{message_type}_msg", data_to_send=notify_data)
 
                     write_config(data=self.maa_reports_cache, config_path="cache.json")
 
-                elif update_status == "Starting":
+                # 管理通知
+                # message_type 的获取方法和上述不同
+                message_type: str = self.msg_route.get("message_type", "")
+                if update_status == "Starting":
                     start_time = time.time()
 
-                    # message_type 的获取方法和上述不同
-                    message_type: str = self.log_to.get("message_type", "")
-                    notify_data = await self.construct_reply(
-                        message_dict=self.log_to,
-                        reply_message=[
+                    reply_data = await self.make_websocket_msg(
+                        original_msg=self.msg_route,
+                        reply_text=[
                             f"MAA 即将在 60s 内开始挂机第一个账号, 总共有 {TotalSteps} 个账号等待挂机"]
                     )
-                    _ = await self.send(api_path=f"send_{message_type}_msg", data_to_send=notify_data)
+
+                elif update_status == "Reconnect":
+                    reply_data = await self.make_websocket_msg(
+                        original_msg=self.msg_route,
+                        reply_text=[
+                            f"MAA 控制器重连成功，当前 {TotalSteps} 个账号等待挂机"]
+                    )
 
                 elif update_status == "Finished":
-                    # message_type 的获取方法和上述不同
-                    message_type: str = self.log_to.get("message_type", "")
-                    notify_data = await self.construct_reply(
-                        message_dict=self.log_to,
-                        reply_message=[
+                    reply_data = await self.make_websocket_msg(
+                        original_msg=self.msg_route,
+                        reply_text=[
                             f"MAA 已完成挂机 {TotalSteps} 个账号, 耗时 {(time.time()-start_time)/60:.3f} 分钟"]
                     )
-                    _ = await self.send(api_path=f"send_{message_type}_msg", data_to_send=notify_data)
+
+                elif update_status == "ManuallyStopped":
+                    reply_data = await self.make_websocket_msg(
+                        original_msg=self.msg_route,
+                        reply_text=[
+                            f"MAA 管理器被终止"]
+                    )
+                else:
+                    continue
+
+                if self.OneBotClients:
+                    msg_id = reply_data.get("echo", "")
+                    logger.debug(f'Sending from MaaCtrl coroutine to OneBot: {reply_data}')
+                    await self.OneBotClients.send(json.dumps(obj=reply_data))
+                    future: asyncio.Future[Any] = asyncio.Future()
+                    self.waiting_pool[msg_id] = future
+                    try:
+                        # cannot call recv while another coroutine is already running recv or recv_streaming
+                        # response = await self.OneBotClients.recv()
+                        response_data = await future
+                        logger.info(f"📩 收到响应:{response_data}")
+                    except Exception as e:
+                        # 如果发生异常 (如连接中断, 超时等), 可以取消future
+                        if msg_id in self.waiting_pool:
+                            future.cancel()
+                        raise e
+                    finally:
+                        # 确保清理等待池
+                        if msg_id in self.waiting_pool:
+                            del self.waiting_pool[msg_id]
+                else:
+                    logger.debug(f"self.OneBotClients is {self.OneBotClients}")
 
             except json.JSONDecodeError as e:
                 logger.error(f"❌ 错误：JSON解析失败！原始消息不是合法的JSON格式。")
@@ -695,5 +831,6 @@ async def process_request(connection: ServerConnection, request: WS11Request):
         logger.warning(f"[ WS ] 来自 ({peername or None}) 的 HTTP 握手错误, 返回 400 BAD_REQUEST")
         return connection.respond(HTTPStatus.BAD_REQUEST, text="upgrade not in connection")
 
-    logger.warning(f"[ WS ] ({connection.subprotocol})")
+    # logger.warning(f"[ WS ] ({connection.subprotocol})")
+    # -> [ WS ] (None)
     return None  # None = 继续 WebSocket 握手
