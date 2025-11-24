@@ -19,6 +19,7 @@ from websockets.exceptions import (
 from websockets.http11 import Request as WS11Request
 
 from file_handler import load_config, write_config
+from llm_parse import parse_command
 
 logger = logging.getLogger('app')
 
@@ -51,6 +52,12 @@ class WebSocketServer:
 
         # 用户映射
         self.user_map: dict[str, dict[str, Any]] = config.get("user_map", {})
+        self.reverse_user_map: dict[int, str] = {
+            user_data["user_id"]: config_name
+            for config_name, user_data in self.user_map.items()
+        }
+        logger.debug(f"self.reverse_user_map {self.reverse_user_map}")
+
         self.msg_route: dict[str, Any] = config.get("msg_route", {})
 
         # 会话 WS 集
@@ -60,6 +67,10 @@ class WebSocketServer:
 
         # 消息等待池
         self.waiting_pool: dict[str, asyncio.Future[Any]] = {}
+
+        # 大模型这一块
+        self.llm:dict[str,str] = config.get("external_llm",{})
+        self.gemini_key:str = self.llm.get("gemini","")
 
     def get_message_text(self, message_dict: dict[str, Any], lower: bool = True):
         chat_message_struct: list[dict[str, Any]] = message_dict.get("message", {})
@@ -472,7 +483,15 @@ class WebSocketServer:
                                             f"控制器状态: {self.maa_reports_cache["Status"]}\n",]
                             )
                         else:
-                            continue
+                            logger.debug(f"incoming llm parse command{chat_command}")
+                            new_command =  await parse_command(
+                                self.gemini_key,chat_command)
+                            new_command.update({"config":self.reverse_user_map.get(user_id,"")})
+                            reply_data = await self.make_websocket_msg(
+                                original_msg=message_dict,
+                                reply_text=[f"测试阶段，仅返回LLM输出: {str(new_command).replace('\'','')}"]
+                            )
+                            logger.debug(f"reply with llm's anser {reply_data}")
 
                         # _ = await self.send(api_path=f"send_{message_type}_msg", data_to_send=reply_data)
                         # message_dict.update({"action": f"send_{message_type}_msg"})
@@ -488,7 +507,8 @@ class WebSocketServer:
                                 logger.info(f"📩 收到响应:{response_data}")
                                 break
                             else:
-                                logger.info(response)
+                                logger.debug(f"Discarding msg without echo: {response}")
+                                continue
 
             except json.JSONDecodeError as e:
                 logger.error(f"❌ 错误：JSON解析失败！原始消息不是合法的JSON格式。")
