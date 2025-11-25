@@ -6,7 +6,7 @@ from http import HTTPStatus
 from types import TracebackType
 from typing import Any, Optional, Type
 
-import aiohttp
+# import aiohttp
 import uuid6
 from aiohttp import web
 from aiohttp.web_request import Request as WebRequest
@@ -33,18 +33,13 @@ class WebSocketServer:
         react_info: list[dict[str, str | int]] = config.get("reaction_to_sender", "")
         self.active_group = [_.get("group_id", "") for _ in react_info if _.get("message_type", "") == "group"]
         self.active_private = [_.get("user_id", "") for _ in react_info if _.get("message_type", "") == "private"]
-        logger.debug(f"groups:{self.active_group}, privates:{self.active_private}")
+        logger.debug(f"[ WS Server][CfgParse] groups:{self.active_group}, privates:{self.active_private}")
 
-        # 发信目标服务器
-        http_info: dict[str, str] = config.get("http_server_info", "")
-        self.http_uri: str = http_info.get("http", "")
-        logger.debug(f"http target: {self.http_uri}")
-
-        # ws 客户端列表
+        # websocket 客户端列表
         self.client_info: list[dict[str, str]] = config.get("client_info", "")
         # 构建 UA->token 映射，便于快速查找
         self.ua_token_map = {info.get("UA", ""): info.get("token", "") for info in self.client_info}
-        logger.debug(f"ua_token_map: {self.ua_token_map}")
+        logger.debug(f"[ WS Server][CfgParse] ua_token_map: {self.ua_token_map}")
 
         # 本地状态缓存
         # self.maa_reports_cache: list[dict[str, Any]] = []
@@ -56,7 +51,7 @@ class WebSocketServer:
             user_data["user_id"]: config_name
             for config_name, user_data in self.user_map.items()
         }
-        logger.debug(f"self.reverse_user_map {self.reverse_user_map}")
+        logger.debug(f"[ WS Server][CfgParse] self.reverse_user_map {self.reverse_user_map}")
 
         self.msg_route: dict[str, Any] = config.get("msg_route", {})
 
@@ -72,6 +67,9 @@ class WebSocketServer:
         self.llm:dict[str,str] = config.get("external_llm",{})
         self.gemini_key:str = self.llm.get("gemini","")
 
+        # END
+        logger.info("[ WS Server][CfgParse] Config File loaded")
+
     def get_message_text(self, message_dict: dict[str, Any], lower: bool = True):
         chat_message_struct: list[dict[str, Any]] = message_dict.get("message", {})
         chat_message_text = ""
@@ -84,48 +82,13 @@ class WebSocketServer:
         else:
             return chat_message_text
 
-    async def make_http_msg(
-        self,
-            message_dict: dict[str, Any],
-            reply_message: list[str] = [""],
-            at: Optional[int] = None
-    ):
-        data: dict[str, Any] = {}
-        structured_message: list[Any] = []
-        message_type = message_dict.get("message_type", "")
-        user_id: str = message_dict.get("user_id", "")
-        group_id: str = message_dict.get("group_id", "")
-
-        # 发信类型 群组/私聊
-        if message_type == "group":
-            data.update({"group_id": f"{group_id}"})
-        elif message_type == "private":
-            data.update({"user_id": f"{user_id}"})
-        else:
-            logger.error("incoming msg type is neither group or private")
-
-        # @user_id 会在消息最前端
-        if at and message_type == "group":
-            structured_message.append({
-                "type": "at",
-                "data": {"qq": f"{at}"}
-            })
-
-        # 拼接加入所有消息
-        for msg in reply_message:
-            structured_message.append({
-                "type": "text",
-                "data": {"text": f"{msg}"}
-            })
-        data.update({"message": structured_message})
-        return data
 
     async def make_websocket_msg(
         self,
             original_msg: dict[str, Any],
-            reply_text: list[str] = [""],
+            reply_text: list[str] = [],
             at: Optional[int] = None,
-            reply_image: Any = None
+            attach_image: list[tuple[str,str]] = []
     ) -> dict[str, Any]:
         websocket_data: dict[str, Any] = {}
         inner_data: dict[str, Any] = {}
@@ -142,7 +105,7 @@ class WebSocketServer:
             websocket_data.update({"action": "send_private_msg"})
             inner_data.update({"user_id": f"{user_id}"})
         else:
-            logger.error("original message type is neither group or private")
+            logger.error("[ Msg/mkMsg][MsgT:ERR] original message type is neither group or private")
             raise ValueError(f"original message type {original_msg} is neither group or private")
 
         # @user_id 会在消息最前端
@@ -160,8 +123,21 @@ class WebSocketServer:
             })
         inner_data.update({"message": structured_message})
 
-        # ENcode image as base64 string
-        # TODO:...
+        # "data": {
+        #     "summary": "[图片]", //截图
+        #     "file": "file://D:/a.jpg" // 本地路径 or
+        #     "file": "http://.....png" // 网络路径 or
+        #     "file": "base64://xxxxxx" // base64编码
+        # }
+        for img,img_summary in attach_image:
+            if img.startswith("http") or img.startswith("base64://"):
+                structured_message.append({
+                    "type":"image",
+                    "data": {"file":img,"summary":img_summary}
+                })
+            else:
+                logger.error("[ Msg/mkMsg][ImgT:ERR]Ignoring img with corrupted format")
+
 
         # 合并消息
         websocket_data.update({"params": inner_data})
@@ -169,170 +145,11 @@ class WebSocketServer:
         websocket_data.update({"echo": str(uuid6.uuid7())})
         return websocket_data
 
-    async def send_dict_to_client(self, websocket: ServerConnection, data_to_send: dict[str, Any], api_path: str = ""):
-        """
-        ## 方法暂时不可用
-        检查接收到的message是否为空，如果不为空，则将data_to_send字典
-        序列化为JSON字符串并通过websocket发送给客户端。
-
-        参数:
-        - websocket: 当前的websocket连接对象。
-        - message: 从客户端接收到的原始消息（用于判断是否为空）。
-        - data_to_send: 要发送给客户端的Python字典。
-        """
-        try:
-            # 改造消息
-            response_payload = data_to_send.copy()
-            if api_path:
-                response_payload['action'] = api_path.strip("/")
-            else:
-                return
-            json_message = json.dumps(response_payload)
-
-            # 发送消息
-            await websocket.send(json_message)
-            logger.info(" (S) 发送消息")
-
-        except TypeError:
-            logger.error("❌ 错误：待发送数据无法序列化为JSON。请确保传入的是字典。")
-        except (ConnectionClosedError, ConnectionClosedOK):
-            logger.error("🔌 警告：发送时连接已关闭，消息未能送达。")
-        except Exception as e:
-            logger.error(f"❓ 未知错误：发送消息时发生意外错误。{e}")
-
-    async def send_dict_to_api(self, data_to_send: dict[str, Any], api_path: str = "") -> Optional[dict[str, Any]]:
-        """
-        ## 这应该是一个过渡方案，但是目前ws通信不可用，还不能切换
-        向指定的URL(API端点)发送POST请求。
-
-        参数:
-        - url: 目标API的基础URL。
-        - data_to_send: 要发送的字典数据。
-        - api_path: 可选的API路径，会附加到url后面。
-
-        返回:
-        - 如果请求成功，返回解析后的JSON响应字典。
-        """
-        try:
-            if not data_to_send:
-                logger.info("⚠️ 警告：发送数据为空，已取消请求。")
-                return None
-
-            # 构造请求 URL/header
-            # 没有适配https，因为这应该是一个过渡方案，最终应该使用ws通信，期间也不想升级为https
-            full_url = f"{self.http_uri.rstrip('/')}/{api_path.lstrip('/')}" if api_path else self.http_uri
-            headers = {"Content-Type": "application/json"}
-
-            # 发送请求
-            async with aiohttp.ClientSession() as session:
-                async with session.post(full_url, headers=headers, json=data_to_send) as response:
-                    if response.status == 200:
-                        logger.info(f"[HTTP] (S) 已成功向 http 服务器 {api_path} 发送POST请求")
-                        logger.debug(f"[HTTP] (S) 向({full_url}) POST ({data_to_send})")
-                        try:
-                            return await response.json()
-
-                        except aiohttp.ContentTypeError:
-                            # 返回非JSON响应
-                            text_resp = await response.text()
-                            logger.error("⚠️ 返回的不是JSON格式：", text_resp)
-                            return {"raw_response": text_resp}
-                    else:
-                        logger.error(f"❌ 请求失败，HTTP状态码: {response.status}")
-                        text_resp = await response.text()
-                        logger.error("📩 响应内容：", text_resp)
-                        return None
-
-        except aiohttp.ClientConnectionError:
-            logger.error("🔌 错误：无法连接到服务器，请检查网络或URL是否正确。")
-        except aiohttp.InvalidURL:
-            logger.error("❌ 错误：提供的URL无效。")
-        except Exception as e:
-            logger.error(f"❓ 未知错误：发送POST请求时发生意外错误。{e}")
-
-        return None
-
-    async def async_http_request_with_retry(
-        self, url: str, data: dict[str, Any], max_retries: int = 3
-    ) -> Optional[aiohttp.ClientResponse]:
-        """
-        使用aiohttp实现带有重试和指数退避机制的异步HTTP POST请求。
-
-        参数:
-            url: 请求的目标URL。
-            data: 作为JSON载荷发送的数据字典。
-            max_retries: 最大重试次数。
-
-        返回:
-            成功时的aiohttp.ClientResponse对象，失败时的None。
-        """
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-        }
-        payload = data.copy()
-        retries = 0
-
-        # 使用ClientSession来管理连接
-        async with aiohttp.ClientSession(headers=headers) as session:
-            while retries <= max_retries:
-                response = None
-                try:
-                    # POST使用json参数自动序列化数据
-                    async with session.post(url, json=payload) as response:
-                        response.raise_for_status()
-
-                        return await response.json()
-
-                except aiohttp.ClientResponseError as e:
-                    # 处理HTTP状态码错误 (4xx, 5xx)
-                    logger.warning(f"HTTP错误状态码：{e.status}")
-                    if response is not None:
-                        # 获取响应内容进行打印（需要使用await）
-                        response_text = await response.text()
-                        logger.info(f"响应内容：{response_text}")
-
-                    if retries < max_retries:
-                        retries += 1
-                        wait_time = 2 ** retries
-                        logger.warning(f"重试 ({retries}/{max_retries})... 暂停 {wait_time} 秒")
-                        await asyncio.sleep(wait_time)  # 异步暂停
-                    else:
-                        logger.error(f"达到最大重试次数 ({max_retries})，放弃。")
-                        return None
-
-                except aiohttp.ClientConnectorError as e:
-                    # 处理连接错误（如DNS解析失败、连接被拒绝等）
-                    logger.info(f"连接错误：{e}")
-
-                    if retries < max_retries:
-                        retries += 1
-                        wait_time = 2 ** retries
-                        logger.warning(f"重试 ({retries}/{max_retries})... 暂停 {wait_time} 秒")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        logger.error(f"达到最大重试次数 ({max_retries})，放弃。")
-                        return None
-
-                except Exception as e:
-                    logger.error(f"发生未知错误：{e}")
-                    return None
-
-    async def send(self, api_path: str, data_to_send: dict[str, Any]):
-        logger.debug(f"[HTTP] (P) 准备发送: {data_to_send}")
-
-        # (variable) message_type: Literal['group', 'private']
-        response = await self.send_dict_to_api(api_path=api_path, data_to_send=data_to_send)
-        if response and response.get('status', '') == 'ok':
-            logger.info("[HTTP] (R) 发送成功")
-        else:
-            logger.info("[HTTP] (R) 发送失败")
-        return response
-
     def check_connection(self, websocket: ServerConnection) -> tuple[bool, Optional[str]]:
         client_address = websocket.remote_address
         # 检查连接信息
         if not getattr(websocket, "request", None):
-            logger.warning(f"[ WS ] (X) 放弃来自({client_address[0]}:{client_address[1]})的未知连接，其 request 为空")
+            logger.warning(f"[ CheckConn ][Req:Null] 放弃来自({client_address[0]}:{client_address[1]})的未知连接，其 request 为空")
             return False, None
 
         # 连接信息获取
@@ -349,13 +166,13 @@ class WebSocketServer:
 
         # UA校验
         if client_user_agent not in self.ua_token_map:
-            logger.warning(f"放弃来自({client_address[0]}:{client_address[1]})的未知连接，其 UA 为({client_user_agent})")
+            logger.warning(f"[ CheckConn ][UA:Unkwn] 放弃来自({client_address[0]}:{client_address[1]})的未知连接，其 UA 为({client_user_agent})")
             return False, None
 
         # Token校验
         expected_token = self.ua_token_map[client_user_agent]
         if client_auth != expected_token:
-            logger.error(f"UA({client_user_agent}) 提供的认证信息不匹配，来自({client_address[0]}:{client_address[1]})")
+            logger.error(f"[ CheckConn ][AuthDeny] UA({client_user_agent}) 提供的认证信息不匹配，来自({client_address[0]}:{client_address[1]})")
             return False, None
 
         return True, client_user_agent
@@ -366,19 +183,9 @@ class WebSocketServer:
             raise ValueError(f"{client_type} is {self.OneBotClients}")
 
         async for ws_income_message in websocket:
-            # 解析传入消息
-            if isinstance(ws_income_message, bytes):
-                try:
-                    message_str = ws_income_message.decode('utf-8')
-                except UnicodeDecodeError:
-                    logger.warning("⚠️ 警告：无法以UTF-8解码字节串消息，跳过。")
-                    continue
-            else:
-                message_str = str(ws_income_message)
-
             try:
                 # 解析JSON
-                message_dict: dict[str, Any] = json.loads(message_str)
+                message_dict: dict[str, Any] = json.loads(ws_income_message)
                 message_type = message_dict.get("message_type", "")
                 user_id: int = message_dict.get("user_id", "")
                 group_id: int = message_dict.get("group_id", "")
@@ -398,8 +205,8 @@ class WebSocketServer:
 
                     # 筛选前缀提示词
                     if chat_message_text.startswith("maa"):
-                        logger.info(f"[ WS ] (R) 收到来自({client_type})的汇报")
-                        logger.debug(f"[ WS ] (R) ({client_type})汇报内容{message_dict}")
+                        logger.info(f"[  Msg/One ][Msg:Recv] 收到来自({client_type})的汇报")
+                        logger.debug(f"[  Msg/One ][Msg:Recv] 汇报内容:\n{message_dict}\n")
                         chat_command = chat_message_text.removeprefix("maa").strip()
 
                         if chat_command in ["help", ""]:
@@ -424,10 +231,10 @@ class WebSocketServer:
                             )
 
                         elif chat_command in ["ws状态", "ws"]:
+                            pong = await websocket.ping()
+                            latency_1 = await pong
                             if self.MaaCtrlClients:
                                 try:
-                                    pong = await websocket.ping()
-                                    latency_1 = await pong
                                     pong = await self.MaaCtrlClients.ping()
                                     latency_2 = await pong
 
@@ -439,16 +246,16 @@ class WebSocketServer:
                                 except ConnectionClosed:
                                     reply_data = await self.make_websocket_msg(
                                         original_msg=message_dict,
-                                        reply_text=[" MAA 控制器的 web socket 连接已断开"]
+                                        reply_text=[f"🐧-{latency_1*1000:.1f}ms-🔄-⛓️‍💥-<⚙>"]
                                     )
                                     self.maa_reports_cache.update({"Connection": "Unreachable"})
                                     write_config(data=self.maa_reports_cache, config_path="cache.json")
                             else:
                                 reply_data = await self.make_websocket_msg(
                                     original_msg=message_dict,
-                                    reply_text=["未与 MAA 控制器建立连接, 且专用 ws 资源未释放"]
+                                    reply_text=[f"🐧-{latency_1*1000:.1f}ms-🔄-⛓️‍💥-<⚙>"]
                                 )
-                                self.maa_reports_cache.update({"Connection": "CannotEstablish"})
+                                self.maa_reports_cache.update({"Connection": "Unreachable"})
                                 write_config(data=self.maa_reports_cache, config_path="cache.json")
 
                         elif chat_command in ["现在", "当前", "currentuser", "current"]:
@@ -483,38 +290,39 @@ class WebSocketServer:
                                             f"控制器状态: {self.maa_reports_cache["Status"]}\n",]
                             )
                         else:
-                            logger.debug(f"incoming llm parse command{chat_command}")
-                            new_command =  await parse_command(
-                                self.gemini_key,chat_command)
+                            logger.debug(f"[  Msg/One ][Fwd2:llm] {chat_command}")
+                            new_command =  await parse_command(self.gemini_key,chat_command)
                             new_command.update({"config":self.reverse_user_map.get(user_id,"")})
                             reply_data = await self.make_websocket_msg(
                                 original_msg=message_dict,
                                 reply_text=[f"测试阶段，仅返回LLM输出: {str(new_command).replace('\'','')}"]
                             )
-                            logger.debug(f"reply with llm's anser {reply_data}")
 
-                        # _ = await self.send(api_path=f"send_{message_type}_msg", data_to_send=reply_data)
-                        # message_dict.update({"action": f"send_{message_type}_msg"})
+                        # 发送消息
                         msg_id = reply_data.get("echo", "")
-                        logger.info(f'{reply_data}')
-                        _ = await self.OneBotClients.send(json.dumps(reply_data))
+
+                        logger.info(f'[  Msg/One ][Dat:Prep] Ready to send message {msg_id}')
+                        logger.debug(f"[  Msg/One ][Dat:Prep] Detail:\n{reply_data}\n")
+                        await self.OneBotClients.send(json.dumps(reply_data))
+
+                        # 等待服务器确认
                         while True:
                             response = await self.OneBotClients.recv()
-                            if isinstance(response, bytes):
-                                response = response.decode('utf-8')
                             response_data: dict[str, Any] = json.loads(response)
                             if (echo := response_data.get("echo", "")) and echo == msg_id:
-                                logger.info(f"📩 收到响应:{response_data}")
+                                if response_data.get("status", "")=='ok':
+                                    logger.info(f"[  Msg/One ][SendConf] Message send confirmed {msg_id}")
+                                    logger.debug(f"[  Msg/One ][SendConf] Detail:\n{response_data}\n")
+                                else:
+                                    logger.warning(f"[  Msg/One ][SendFail] Message send FAILED {msg_id}")
+                                    logger.debug(f"[  Msg/One ][SendFail] Detail:\n{response_data}\n")
                                 break
                             else:
-                                logger.debug(f"Discarding msg without echo: {response}")
+                                logger.debug(f"[  Msg/One ][ Warning] Discarding msg without echo: {response}")
                                 continue
 
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ 错误：JSON解析失败！原始消息不是合法的JSON格式。")
-                logger.error(f"   错误详情：{e}")
             except Exception as e:
-                logger.error(f"❓ 未知错误：处理消息时发生意外错误。{e}")
+                logger.error(f"[  Msg/One ][ Unknown] 未知错误：处理消息时发生意外错误。{e}")
 
     async def _handler_MaaCtrlClient(self):
         client_type = "MaaCtrlClients"
@@ -523,21 +331,11 @@ class WebSocketServer:
         # start_time 会在 starting 部分 覆盖，此处保证变量绑定
         start_time = time.time()
         async for ws_income_message in websocket:
-            # 解析传入消息
-            if isinstance(ws_income_message, bytes):
-                try:
-                    message_str = ws_income_message.decode('utf-8')
-                except UnicodeDecodeError:
-                    logger.warning("⚠️ 警告：无法以UTF-8解码字节串消息，跳过。")
-                    continue
-            else:
-                message_str = str(ws_income_message)
-
             try:
                 # 解析并补充JSON
-                message_dict: dict[str, Any] = json.loads(message_str)
-                logger.info(f"[ WS ] (R) 收到来自({client_type})的汇报")
-                logger.debug(f"[ WS ] (R) ({client_type})汇报内容{message_dict}")
+                message_dict: dict[str, Any] = json.loads(ws_income_message)
+                logger.info(f"[  Msg/Maa ][Msg:Recv] 收到来自({client_type})的汇报")
+                logger.debug(f"[  Msg/Maa ][Msg:Recv] 汇报内容:\n{message_dict}\n")
                 message_dict.update({"lastUpdate": time.time()})
 
                 # 上一个Update的信息缓存
@@ -549,12 +347,12 @@ class WebSocketServer:
                 self.maa_reports_cache.update(message_dict)
                 notify_message_list: list[str] = []
 
-                # 如果汇报有配置才提醒
                 user: str = message_dict.get("CurruentUser", "")
                 TotalSteps: str = message_dict.get("TotalSteps", "")
 
                 # 个性化通知
                 if (update_status := message_dict.get("Status", "")) == "Next_Step":
+                    logger.debug(f"[  Msg/Maa ][Dat:Prep] Preparing At message")
                     # 查本地表
                     user_id: int = self.user_map[user].get("user_id", "")
                     group_id: int = self.user_map[user].get("group_id", "")
@@ -566,10 +364,9 @@ class WebSocketServer:
 
                     # 特别地，群聊发送时，获取上一个人信息
                     if message_type == "group" and last_user and self.OneBotClients:
+
                         msg_id = str(uuid6.uuid7())
                         request_data: dict[str, Any] = {"action": "get_group_member_info", "echo": msg_id}
-                        future: asyncio.Future[Any] = asyncio.Future()
-                        self.waiting_pool[msg_id] = future
                         request_data.update({
                             "params": {
                                 "group_id": group_id,
@@ -577,15 +374,19 @@ class WebSocketServer:
                                 "no_cache": False
                             }
                         })
+                        logger.info(f"[  Msg/Maa ][Dat:Prep] Ready to fetch user card from group")
 
+                        # 使用协程池向OneBot询问
+                        logger.info(f"[ > OneBot ][Req:Sent] Asking OneBot about user card")
+                        logger.debug(f"[ > OneBot ][Req:Sent] Detail:\n{request_data}\n")
                         await self.OneBotClients.send(json.dumps(request_data))
-                        # _api_response = await self.send("get_group_member_info", {
-                        #     "group_id": group_id,
-                        #     "user_id": last_user,
-                        #     "no_cache": False
-                        # })
-                        _api_response = await future
+                        future: asyncio.Future[Any] = asyncio.Future()
+                        self.waiting_pool[msg_id] = future
+                        _api_response:dict[str,Any] = await future
+
                         if _api_response:
+                            logger.info(f"[ < OneBot ][Req:Back] Receiving user card")
+                            logger.debug(f"[ < OneBot ][Req:Back] Detail:\n{_api_response}\n")
                             _api_data: dict[str, Any] | None = _api_response.get("data", {})
                             if _api_data:
                                 last_user_card: str = _api_data.get("card", "")
@@ -600,47 +401,48 @@ class WebSocketServer:
                         reply_text=notify_message_list,
                         at=user_id
                     )
-
                     write_config(data=self.maa_reports_cache, config_path="cache.json")
 
-                # 管理通知
-                # message_type 的获取方法和上述不同
-                message_type: str = self.msg_route.get("message_type", "")
-                if update_status == "Starting":
-                    start_time = time.time()
-
-                    reply_data = await self.make_websocket_msg(
-                        original_msg=self.msg_route,
-                        reply_text=[
-                            f"MAA 即将在 60s 内开始挂机第一个账号, 总共有 {TotalSteps} 个账号等待挂机"]
-                    )
-
-                elif update_status == "Reconnect":
-                    reply_data = await self.make_websocket_msg(
-                        original_msg=self.msg_route,
-                        reply_text=[
-                            f"MAA 控制器重连成功，当前 {TotalSteps} 个账号等待挂机"]
-                    )
-
-                elif update_status == "Finished":
-                    reply_data = await self.make_websocket_msg(
-                        original_msg=self.msg_route,
-                        reply_text=[
-                            f"MAA 已完成挂机 {TotalSteps} 个账号, 耗时 {(time.time()-start_time)/60:.3f} 分钟"]
-                    )
-
-                elif update_status == "ManuallyStopped":
-                    reply_data = await self.make_websocket_msg(
-                        original_msg=self.msg_route,
-                        reply_text=[
-                            f"MAA 管理器被终止"]
-                    )
                 else:
-                    continue
+                    # 管理通知
+                    # message_type 的获取方法和上述不同
+                    message_type: str = self.msg_route.get("message_type", "")
+                    if update_status == "Starting":
+                        start_time = time.time()
+
+                        reply_data = await self.make_websocket_msg(
+                            original_msg=self.msg_route,
+                            reply_text=[
+                                f"MAA 即将在 60s 内开始挂机第一个账号, 总共有 {TotalSteps} 个账号等待挂机"]
+                        )
+
+                    elif update_status == "Reconnect":
+                        reply_data = await self.make_websocket_msg(
+                            original_msg=self.msg_route,
+                            reply_text=[
+                                f"MAA 控制器重连成功，当前 {TotalSteps} 个账号等待挂机"]
+                        )
+
+                    elif update_status == "Finished":
+                        reply_data = await self.make_websocket_msg(
+                            original_msg=self.msg_route,
+                            reply_text=[
+                                f"MAA 已完成挂机 {TotalSteps} 个账号, 耗时 {(time.time()-start_time)/60:.3f} 分钟"]
+                        )
+
+                    elif update_status == "ManuallyStopped":
+                        reply_data = await self.make_websocket_msg(
+                            original_msg=self.msg_route,
+                            reply_text=[
+                                f"MAA 管理器被终止"]
+                        )
+                    else:
+                        continue
 
                 if self.OneBotClients:
                     msg_id = reply_data.get("echo", "")
-                    logger.debug(f'Sending from MaaCtrl coroutine to OneBot: {reply_data}')
+                    logger.info(f'[ > OneBot ][Send:Msg] Ready to send message {msg_id}')
+                    logger.debug(f'[ > OneBot ][Send:Msg] Detail:\n{reply_data}\n')
                     await self.OneBotClients.send(json.dumps(obj=reply_data))
                     future: asyncio.Future[Any] = asyncio.Future()
                     self.waiting_pool[msg_id] = future
@@ -648,24 +450,24 @@ class WebSocketServer:
                         # cannot call recv while another coroutine is already running recv or recv_streaming
                         # response = await self.OneBotClients.recv()
                         response_data = await future
-                        logger.info(f"📩 收到响应:{response_data}")
+                        logger.info(f"[  Msg/Maa ][SendConf] Message send confirmed {msg_id}")
+                        logger.debug(f"[  Msg/Maa ][SendConf] Detail:\n{response_data}\n")
                     except Exception as e:
                         # 如果发生异常 (如连接中断, 超时等), 可以取消future
                         if msg_id in self.waiting_pool:
                             future.cancel()
+                        logger.warning(f"[  Msg/Maa ][SendFail] Message send FAILED")
+                        logger.debug(f"[  Msg/Maa ][SendFail] Detail:\n{e}\n")
                         raise e
                     finally:
                         # 确保清理等待池
                         if msg_id in self.waiting_pool:
                             del self.waiting_pool[msg_id]
                 else:
-                    logger.debug(f"self.OneBotClients is {self.OneBotClients}")
+                    logger.debug(f"[  Msg/Maa ][SendFail] self.OneBotClients is {self.OneBotClients}")
 
-            except json.JSONDecodeError as e:
-                logger.error(f"❌ 错误：JSON解析失败！原始消息不是合法的JSON格式。")
-                logger.error(f"   错误详情：{e}")
             except Exception as e:
-                logger.error(f"❓ 未知错误：处理消息时发生意外错误。{e}")
+                logger.error(f"[  Msg/Maa ][Unknown] 未知错误：处理消息时发生意外错误。{e}")
 
     async def handler(self, websocket: ServerConnection):
         """
@@ -680,13 +482,13 @@ class WebSocketServer:
             await websocket.close()
             return
 
-        logger.info(f"[ WS ] (E) 建立来自({client_address[0]}:{client_address[1]})的({client_type})连接")
+        logger.info(f"[ Msg/Main ][Conn:Est] 建立来自({client_address[0]}:{client_address[1]})的({client_type})连接")
 
         try:
             if client_type == 'OneBot/11':
                 if self.OneBotClients != None:
                     logger.info(
-                        f"[ WS ] (X) 已经存在({client_type})的未释放连接, 来自({client_address[0]}:{client_address[1]})的新连接被放弃")
+                        f"[ Msg/Main ][AuthDeny] (X) 已经存在({client_type})的未释放连接, 来自({client_address[0]}:{client_address[1]})的新连接被放弃")
                 else:
                     self.OneBotClients = websocket
                 await self._handler_OneBotClient()
@@ -694,29 +496,30 @@ class WebSocketServer:
             elif client_type == 'MaaCtrl/00':
                 if self.MaaCtrlClients != None:
                     logger.info(
-                        f"[ WS ] (X) 已经存在({client_type})的未释放连接, 来自({client_address[0]}:{client_address[1]})的新连接被放弃")
+                        f"[ Msg/Main ][AuthDeny] (X) 已经存在({client_type})的未释放连接, 来自({client_address[0]}:{client_address[1]})的新连接被放弃")
                 else:
                     self.MaaCtrlClients = websocket
                 await self._handler_MaaCtrlClient()
 
         except ConnectionClosedError as e:
-            logger.error(f"🔌 连接异常断开: {client_address}。错误码/状态：{e.code}。")
+            logger.error(f"[ Msg/Main ][Conn:Out] (X) 连接异常断开: {client_address}。错误码/状态：{e.code}。")
         except ConnectionClosedOK as e:
-            logger.error(f"👋 连接正常关闭: {client_address}。")
+            logger.info(f"[ Msg/Main ][Conn:Out] 连接正常关闭: {client_address}。")
         except Exception as e:
-            logger.error(f"🚨 顶级错误：处理连接时发生致命错误。{e}")
+            logger.error(f"[ Msg/Main ][?Unknown] 处理连接时发生致命错误。{e}")
 
         finally:
-            logger.info(f"🛑 连接处理结束: {client_address}")
             await websocket.close()
+            logger.info(f"[ Msg/Main ][Conn:Out] 连接关闭: {client_address}")
             if client_type == 'OneBot/11':
                 self.OneBotClients = None
-                logger.info(f"✅ 已经释放连接 OneBot/11")
+                logger.info(f"[  Msg/One ][ResetVar] 已经释放 OneBot/11")
             elif client_type == 'MaaCtrl/00':
                 self.MaaCtrlClients = None
-                logger.info(f"✅ 已经释放连接 MaaCtrl/00")
+                logger.info(f"[  Msg/Maa ][ResetVar] 已经释放 MaaCtrl/00")
             else:
-                logger.info(f"❓ 未知链接类型")
+                logger.info(f"[  Msg/Any ][Conn:Out] Unknown ws client.")
+                pass
 
 
 class AioHttpServerWrapper:
