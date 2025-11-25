@@ -4,6 +4,23 @@ import os
 from typing import Any
 
 
+class ColoredFormatter(logging.Formatter):
+    """自定义的日志格式化类，用于在控制台输出带颜色的日志。"""
+
+    COLOR_CODES = {
+        logging.DEBUG: '[90m',  # 蓝色
+        logging.INFO: '[92m',  # 绿色
+        logging.WARNING: '[93m',  # 黄色
+        logging.ERROR: '[91m',  # 红色
+        # logging.CRITICAL: '[41m[97m'  # 背景红色，字体白色
+    }
+    RESET_CODE = '[0m'  # 重置颜色
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_message = super().format(record)
+        return self.COLOR_CODES.get(record.levelno, '') + log_message + self.RESET_CODE
+
+
 def setup_logging(log_file_path: str = './log/app.log', log_level: int = logging.INFO):
     """配置并初始化日志系统。"""
 
@@ -15,21 +32,25 @@ def setup_logging(log_file_path: str = './log/app.log', log_level: int = logging
     logger.setLevel(log_level)
 
     if not logger.handlers:
+        # 文件处理器，不带颜色
         file_handler = logging.handlers.RotatingFileHandler(
             log_file_path,
             maxBytes=1024*1024*5,
             backupCount=5,
             encoding='utf-8'
         )
-
-        console_handler = logging.StreamHandler()
-
-        formatter = logging.Formatter(
+        file_formatter = logging.Formatter(
             '%(asctime)s [%(levelname)-8s][%(module)s:%(lineno)3d]|%(message)s'
         )
-
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
+
+        # 控制台处理器，带颜色
+        console_handler = logging.StreamHandler()
+        colored_formatter = ColoredFormatter(
+            '%(message)s'
+        )
+        console_handler.setFormatter(colored_formatter)
         logger.addHandler(console_handler)
 
     return logger
