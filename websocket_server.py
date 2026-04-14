@@ -181,6 +181,48 @@ class WebSocketServer:
     def get_latest_screenshot_image(self) -> Image.Image | None:
         return self.latest_screenshot_image
 
+    @staticmethod
+    def _normalize_execution_configs(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _persist_maa_cache(self) -> None:
+        write_config(data=self.maa_reports_cache, config_path="cache.json")
+        self.notify_dashboard_state_changed()
+
+    def _apply_maa_runtime_state(self, update_status: str) -> None:
+        if update_status == "Starting":
+            self.maa_reports_cache["state"] = "Running"
+            self.maa_reports_cache["progressPhase"] = "not_started"
+            self.maa_reports_cache["lastCompletedAt"] = 0.0
+        elif update_status == "Next_Step":
+            self.maa_reports_cache["state"] = "Running"
+            self.maa_reports_cache["progressPhase"] = "running"
+            self.maa_reports_cache["lastCompletedAt"] = 0.0
+        elif update_status == "Reconnect":
+            self.maa_reports_cache["state"] = "Running"
+            self.maa_reports_cache["progressPhase"] = (
+                "running" if str(self.maa_reports_cache.get("Step") or "").strip() else "not_started"
+            )
+        elif update_status == "AllCompleted":
+            self.maa_reports_cache["state"] = "Idle"
+            self.maa_reports_cache["progressPhase"] = "completed"
+            self.maa_reports_cache["lastCompletedAt"] = time.time()
+        elif update_status == "Failed":
+            self.maa_reports_cache["state"] = "Idle"
+            self.maa_reports_cache["progressPhase"] = "failed"
+            self.maa_reports_cache["lastCompletedAt"] = 0.0
+        elif update_status == "ManuallyStopped":
+            self.maa_reports_cache["state"] = "Idle"
+            self.maa_reports_cache["progressPhase"] = "stopped"
+            self.maa_reports_cache["lastCompletedAt"] = 0.0
+
+    def _mark_maactrl_disconnected(self) -> None:
+        self.maa_reports_cache["Connection"] = "Disconnected"
+        self.maa_reports_cache["lastUpdate"] = time.time()
+        self._persist_maa_cache()
+
     def get_message_text(self, message_dict: Message, lower: bool = True) -> str:
         """
         从消息字典中提取文本内容
@@ -556,6 +598,10 @@ class WebSocketServer:
             try:
                 # 解析并补充JSON
                 message_dict: dict[str, Any] = json.loads(ws_income_message)
+                if "ExecutionConfigs" in message_dict:
+                    message_dict["ExecutionConfigs"] = self._normalize_execution_configs(
+                        message_dict.get("ExecutionConfigs")
+                    )
                 
                 # 提取关键信息用于日志摘要
                 # 匹配 async_main.py 的字段名
@@ -575,14 +621,15 @@ class WebSocketServer:
 
                 # 更新本地缓存
                 self.maa_reports_cache.update(message_dict)
-                self.notify_dashboard_state_changed()
+                update_status = message_dict.get("Status", "")
+                self._apply_maa_runtime_state(update_status)
+                self._persist_maa_cache()
                 notify_message_list: list[str] = []
 
                 user: str = message_dict.get("CurruentUser") or ""
-                TotalSteps: str = message_dict.get("TotalSteps") or ""
 
                 # 个性化通知
-                if (update_status := message_dict.get("Status", "")) == "Next_Step":
+                if update_status == "Next_Step":
                     logger.debug(f"{LogTag.MSG_MAA} Preparing At message")
                     # 查本地表
                     if not user or user not in self.user_map:
@@ -652,34 +699,9 @@ class WebSocketServer:
                         reply_text=notify_message_list,
                         at=user_id
                     )
-                    write_config(data=self.maa_reports_cache, config_path="cache.json")
-                    self.notify_dashboard_state_changed()
 
                 else:
-                    # 简化状态系统 - v2.5风格
-                    # 仅更新state，不发送通知
-                    if update_status == "Starting":
-                        self.maa_reports_cache["state"] = "Running"
-                        write_config(data=self.maa_reports_cache, config_path="cache.json")
-                        self.notify_dashboard_state_changed()
-
-                    elif update_status == "Reconnect":
-                        self.maa_reports_cache["state"] = "Running"
-                        write_config(data=self.maa_reports_cache, config_path="cache.json")
-                        self.notify_dashboard_state_changed()
-
-                    elif update_status == "Finished":
-                        self.maa_reports_cache["state"] = "Idle"
-                        write_config(data=self.maa_reports_cache, config_path="cache.json")
-                        self.notify_dashboard_state_changed()
-
-                    elif update_status == "ManuallyStopped":
-                        self.maa_reports_cache["state"] = "Idle"
-                        write_config(data=self.maa_reports_cache, config_path="cache.json")
-                        self.notify_dashboard_state_changed()
-                    else:
-                        continue
-                    # 非Next_Step状态，不发送通知
+                    # 非Next_Step状态只更新状态，不发送通知
                     continue
 
                 if self.OneBotClients:
@@ -811,6 +833,7 @@ class WebSocketServer:
                 logger.info(f"{LogTag.MSG_ONEBOT} OneBot客户端已断开 | 类型: OneBot/11")
             elif client_type == 'MaaCtrl/00':
                 self.MaaCtrlClients = None
+                self._mark_maactrl_disconnected()
                 logger.info(f"{LogTag.MSG_MAA} MaaCtrl客户端已断开 | 类型: MaaCtrl/00")
             else:
                 logger.debug(f"{LogTag.MSG_MAIN} 未知客户端类型: {client_type}")
