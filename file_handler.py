@@ -3,6 +3,9 @@ import logging.handlers
 import os
 from typing import Any
 
+# 导入新的日志配置
+from src.logging_system import get_config_logger
+
 
 class ColoredFormatter(logging.Formatter):
     """自定义的日志格式化类，用于在控制台输出带颜色的日志。"""
@@ -67,22 +70,61 @@ def load_config(config_path: str = "config.json") -> dict[str, Any]:
     返回:
     - 成功读取时返回配置字典。
     """
+    logger = get_config_logger()
+    
     if not os.path.exists(config_path):
+        logger.error(f"配置文件不存在: {config_path}")
         raise FileNotFoundError(f"❌ 配置文件不存在: {config_path}")
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config: dict[str, Any] = json.load(f)
+            logger.info(f"配置文件已加载: {config_path}")
             return config
 
     except json.JSONDecodeError as e:
+        logger.error(f"配置文件解析错误（JSON格式不正确）: {e}")
         raise ValueError(f"❌ 配置文件解析错误（JSON格式不正确）: {e}")
 
 
 def write_config(data: dict[str, Any], config_path: str = "cache.json"):
+    logger = get_config_logger()
+    
     try:
         with open(config_path, "w") as f:
             json.dump(obj=data, fp=f)
+        logger.debug(f"配置已写入文件: {config_path}")
 
     except json.JSONDecodeError as e:
+        logger.error(f"配置文件解析错误（JSON格式不正确）: {e}")
         raise ValueError(f"❌ 配置文件解析错误（JSON格式不正确）: {e}")
+    except Exception as e:
+        logger.error(f"写入配置文件时发生错误: {e}")
+        raise
+
+
+def load_cache(cache_path: str = "cache.json") -> dict[str, Any]:
+    """
+    读取缓存文件 cache.json。
+    如果文件不存在，返回空字典。
+
+    参数:
+    cache_path: 缓存文件路径，默认为当前目录下的 cache.json。
+
+    返回:
+    - 成功读取时返回缓存字典，文件不存在时返回空字典。
+    """
+    logger = get_config_logger()
+    
+    if not os.path.exists(cache_path):
+        logger.info(f"缓存文件不存在，返回空字典: {cache_path}")
+        return {}
+    
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache: dict[str, Any] = json.load(f)
+            logger.debug(f"缓存文件已加载: {cache_path}")
+            return cache
+    except json.JSONDecodeError as e:
+        logger.error(f"缓存文件解析错误（JSON格式不正确）: {e}")
+        raise ValueError(f"❌ 缓存文件解析错误（JSON格式不正确）: {e}")
