@@ -21,7 +21,6 @@ from websockets.exceptions import (
 )
 
 from file_handler import write_config, load_cache
-from llm_parser import parse_command
 from src.logging_system import get_web_server_logger, log_exception
 
 # Dify集成模块
@@ -135,10 +134,6 @@ class WebSocketServer:
 
         # 消息等待池
         self.waiting_pool: dict[str, asyncio.Future[Any]] = {}
-
-        # 大模型配置
-        self.llm: dict[str, str] = config.get("external_llm", {})
-        self.gemini_key: str = self.llm.get("gemini", "")
 
         # dify配置
         self.dify_api_key: str = config.get("dify_api_key", "")
@@ -550,12 +545,10 @@ class WebSocketServer:
                                 attach_image=[(report_image, "MAA Status Report")]
                             )
                         else:
-                            logger.debug(f"{LogTag.MSG_ONEBOT} Fwd2:llm {chat_command}")
-                            new_command = await parse_command(self.gemini_key, chat_command)
-                            new_command.update({"config": self.reverse_user_map.get(user_id, "")})
+                            logger.info(f"{LogTag.MSG_ONEBOT} 未识别MAA命令，改为引导访问Dashboard | 命令: {chat_command}")
                             reply_data = await self.make_websocket_msg(
                                 original_msg=message_dict,
-                                reply_text=[f"测试阶段，仅返回LLM输出: {str(new_command).replace('\'','')}"]
+                                reply_text=["访问 https://maa.nslc.top 以查看详情"]
                             )
 
                         # 发送消息

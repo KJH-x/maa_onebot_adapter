@@ -16,7 +16,6 @@ import asyncio
 from src.logging_config import get_logger
 from dify_client import DifyIntegration
 from src.config_manager import ConfigManager
-from llm_parser import parse_command
 
 logger = get_logger(__name__)
 
@@ -176,7 +175,7 @@ class MessageProcessor:
             if command in [cmd_key, cmd_key.replace("_", "")]:
                 return await handler(original_msg, client_id)
         
-        # 未知命令转发到LLM
+        # 未知命令统一引导到Dashboard
         return await self._handle_unknown_command(command, original_msg, client_id)
     
     async def _handle_maa_help(self, original_msg: Dict[str, Any], client_id: str) -> Dict[str, Any]:
@@ -261,25 +260,9 @@ class MessageProcessor:
             return self._create_response(f"AI聊天失败：{str(e)}", original_msg)
     
     async def _handle_unknown_command(self, command: str, original_msg: Dict[str, Any], client_id: str) -> Dict[str, Any]:
-        """处理未知命令（转发到LLM）"""
-        try:
-            # 使用现有的parse_command函数
-            gemini_key = self.config_manager.get("gemini_key", "")
-            if not gemini_key:
-                return self._create_response("Gemini API密钥未配置", original_msg)
-            
-            new_command = await parse_command(gemini_key, command)
-            
-            # 添加配置信息
-            config_name = "default"  # 这里需要根据用户ID获取实际配置
-            new_command.update({"config": config_name})
-            
-            response_text = f"测试阶段，仅返回LLM输出: {str(new_command).replace('\'', '')}"
-            return self._create_response(response_text, original_msg)
-            
-        except Exception as e:
-            logger.error(f"LLM解析失败: {e}", exc_info=True)
-            return self._create_response(f"命令解析失败：{str(e)}", original_msg)
+        """处理未知命令（统一引导到Dashboard）"""
+        logger.info(f"未知MAA命令，返回Dashboard链接: {command}")
+        return self._create_response("访问 https://maa.nslc.top 以查看详情", original_msg)
     
     async def _handle_status_request(self, message: Dict[str, Any], client_id: str) -> Dict[str, Any]:
         """处理状态请求"""
