@@ -4,3 +4,4 @@ log/
 config/
 __pycache__/
 test-script/
+*codex*.md
